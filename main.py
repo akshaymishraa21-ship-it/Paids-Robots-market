@@ -20,7 +20,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from keep_alive import keep_alive
+from keep_alive import keep_alive[cite: 2]
 
 BOT_TOKEN = os.environ.get(
     "BOT_TOKEN", "8488349023:AAG75msvlzTzeFbgXe4_8SnHldKEycgfLq8"
@@ -67,7 +67,8 @@ cursor.executescript("""
         max_winners INTEGER,
         button_text TEXT,
         status TEXT,
-        message_data TEXT
+        message_data TEXT,
+        created_at DATETIME
     );
     CREATE TABLE IF NOT EXISTS giveaway_entries (
         giveaway_id INTEGER,
@@ -81,6 +82,11 @@ cursor.executescript("""
 
 try:
     cursor.execute("ALTER TABLE giveaways ADD COLUMN sponsor_channel TEXT")
+except sqlite3.OperationalError:
+    pass
+
+try:
+    cursor.execute("ALTER TABLE giveaways ADD COLUMN created_at DATETIME")
 except sqlite3.OperationalError:
     pass
 conn.commit()
@@ -368,7 +374,7 @@ async def edit_spenders(message: Message):
     await message.reply(apply_premium_emojis(reply_msg), parse_mode="HTML")
 
 
-# --- NEW INTERACTIVE GIVEAWAY EDIT COMMAND (/editgw) ---
+# --- INTERACTIVE GIVEAWAY EDIT COMMAND (/editgw) ---
 @dp.message(Command("editgw"))
 async def cmd_edit_giveaway(message: Message, state: FSMContext):
     if not is_admin(message.from_user): 
@@ -449,6 +455,68 @@ async def process_edit_value(message: Message, state: FSMContext):
     await state.clear()
     await update_live_post(gw_id)
     await message.reply(f"✅ Giveaway #{gw_id} successfully updated!")
+
+
+# --- GIVEAWAYS MANAGEMENT COMMAND (/giveaways) ---
+@dp.message(Command("giveaways"))
+async def cmd_manage_giveaways(message: Message):
+    if not is_admin(message.from_user):
+        return
+
+    parts = message.text.split()
+    
+    # If subcommand 'end' is triggered, e.g., /giveaways end 2
+    if len(parts) >= 3 and parts[1].lower() == "end":
+        try:
+            target_id = int(parts[2])
+        except ValueError:
+            return await message.reply("⚠️ Invalid Giveaway ID format.")
+
+        cursor.execute("SELECT id, status FROM giveaways WHERE id=?", (target_id,))
+        gw = cursor.fetchone()
+        if not gw:
+            return await message.reply(f"⚠️ Giveaway #{target_id} not found.")
+
+        # Delete the target giveaway and its associated entries
+        cursor.execute("DELETE FROM giveaways WHERE id=?", (target_id,))
+        cursor.execute("DELETE FROM giveaway_entries WHERE giveaway_id=?", (target_id,))
+        
+        # Re-index remaining active giveaways sequentially so IDs shift down (e.g. 9 becomes 8)
+        cursor.execute("SELECT id FROM giveaways ORDER BY id ASC")
+        remaining = cursor.fetchall()
+        
+        for new_idx, row in enumerate(remaining, start=1):
+            old_id = row[0]
+            if old_id != new_idx:
+                cursor.execute("UPDATE giveaways SET id=? WHERE id=?", (new_idx, old_id))
+                cursor.execute("UPDATE giveaway_entries SET giveaway_id=? WHERE giveaway_id=?", (new_idx, old_id))
+        
+        # Reset SQLite autoincrement sequence based on max active ID
+        cursor.execute("SELECT MAX(id) FROM giveaways")
+        max_id_res = cursor.fetchone()
+        max_id = max_id_res[0] if max_id_res and max_id_res[0] else 0
+        cursor.execute("DELETE FROM sqlite_sequence WHERE name='giveaways'")
+        cursor.execute("INSERT INTO sqlite_sequence(name, seq) VALUES('giveaways', ?)", (max_id,))
+        
+        conn.commit()
+        return await message.reply(f"🗑 Giveaway #{target_id} deleted successfully, and remaining IDs have been re-indexed!")
+
+    # Otherwise, list running/active giveaways
+    cursor.execute("SELECT id, description, created_at, status FROM giveaways WHERE status='active' ORDER BY id ASC")
+    gws = cursor.fetchall()
+    
+    if not gws:
+        return await message.reply("📋 **Active Giveaways:**\n\nNo active giveaways running in the background.")
+
+    text = f"📋 **Running Giveaways ({len(gws)} active):**\n\n"
+    for g in gws:
+        gw_id, desc, created_at, status = g[0], g[1], g[2], g[3]
+        short_desc = (desc[:30] + '...') if len(desc) > 30 else desc
+        created_str = created_at[:16].replace('T', ' ') if created_at else "Unknown"
+        text += f"🆔 **ID: `{gw_id}`**\n📝 {short_desc}\n🕒 Created: `{created_str}`\n\n"
+
+    text += "💡 To delete/end a giveaway, use:\n`/giveaways end <ID>`"
+    await message.reply(text, parse_mode="Markdown")
 
 
 @dp.message(Command("addstars"))
@@ -630,11 +698,12 @@ async def gw_finalize(message: Message, state: FSMContext):
     target = message.text.strip()
     data = await state.get_data()
     sponsor_channel = data["sponsor_channel"]
+    created_at = datetime.now().isoformat()
 
     cursor.execute(
         """
-        INSERT INTO giveaways (photo_id, description, end_time, max_participants, max_winners, button_text, status, message_data, sponsor_channel)
-        VALUES (?, ?, ?, ?, ?, ?, 'active', '{}', ?)
+        INSERT INTO giveaways (photo_id, description, end_time, max_participants, max_winners, button_text, status, message_data, sponsor_channel, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'active', '{}', ?, ?)
     """,
         (
             data["photo_id"],
@@ -644,6 +713,7 @@ async def gw_finalize(message: Message, state: FSMContext):
             data["max_wins"],
             data["final_btn_text"],
             sponsor_channel,
+            created_at,
         ),
     )
     gw_id = cursor.lastrowid
@@ -1239,5 +1309,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    keep_alive()
+    keep_alive() # type: ignore
     asyncio.run(main())
