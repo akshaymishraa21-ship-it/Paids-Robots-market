@@ -104,6 +104,11 @@ class MakeGiveaway(StatesGroup):
 class RepostGiveaway(StatesGroup):
     waiting_for_target = State()
 
+class EditGiveaway(StatesGroup):
+    waiting_for_id = State()
+    waiting_for_field = State()
+    waiting_for_new_value = State()
+
 
 def is_admin(user):
     if not user:
@@ -335,31 +340,110 @@ async def reset_database(message: Message):
     )
 
 
+# --- INTERACTIVE GIVEAWAY EDIT COMMAND ---
 @dp.message(Command("edit"))
-async def edit_spenders(message: Message):
-    if not is_admin(message.from_user):
+async def cmd_edit_giveaway(message: Message, state: FSMContext):
+    if not is_admin(message.from_user): 
         return
+    
     parts = message.text.split()
-    if len(parts) != 3:
-        return await message.reply("⚠️ Usage: /edit @username new_amount")
-    username = parts[1].replace("@", "")
-    try:
-        new_amount = int(parts[2])
-    except ValueError:
-        return await message.reply("⚠️ Amount must be a number.")
+    # Support legacy leaderboard edit if 3 arguments are passed (/edit @username amount)
+    if len(parts) == 3 and parts[1].startswith("@"):
+        username = parts[1].replace("@", "")
+        try:
+            new_amount = int(parts[2])
+        except ValueError:
+            return await message.reply("⚠️ Amount must be a number.")
 
-    cursor.execute("DELETE FROM spenders WHERE LOWER(username)=?", (username.lower(),))
-    if new_amount > 0:
-        cursor.execute(
-            "INSERT INTO spenders (user_id, username, stars, timestamp) VALUES (?, ?, ?, ?)",
-            (0, username, new_amount, datetime.now()),
-        )
-        reply_msg = f"✅ Set @{username}'s total to {new_amount} Stars!"
-    else:
-        reply_msg = f"🗑 Removed @{username} from the leaderboard entirely."
+        cursor.execute("DELETE FROM spenders WHERE LOWER(username)=?", (username.lower(),))
+        if new_amount > 0:
+            cursor.execute(
+                "INSERT INTO spenders (user_id, username, stars, timestamp) VALUES (?, ?, ?, ?)",
+                (0, username, new_amount, datetime.now()),
+            )
+            reply_msg = f"✅ Set @{username}'s total to {new_amount} Stars!"
+        else:
+            reply_msg = f"🗑 Removed @{username} from the leaderboard entirely."
+        conn.commit()
+        await update_live_messages()
+        return await message.reply(apply_premium_emojis(reply_msg), parse_mode="HTML")
+
+    # Otherwise, interactive giveaway edit wizard
+    cursor.execute("SELECT id, description, status FROM giveaways WHERE status='active'")
+    gws = cursor.fetchall()
+    if not gws:
+        return await message.reply("⚠️ No active giveaways found to edit.")
+    
+    res = "✏️ **Active Giveaways to Edit:**\n" + "\n".join([f"ID: `{g[0]}` | {g[1][:25]}..." for g in gws])
+    res += "\n\n**Please send the ID of the giveaway you want to edit:**"
+    
+    await state.set_state(EditGiveaway.waiting_for_id)
+    await message.reply(res, parse_mode="Markdown")
+
+@dp.message(EditGiveaway.waiting_for_id)
+async def process_edit_id(message: Message, state: FSMContext):
+    try:
+        gw_id = int(message.text.strip())
+    except ValueError:
+        return await message.reply("⚠️ Please send a valid numeric Giveaway ID.")
+    
+    cursor.execute("SELECT id FROM giveaways WHERE id=? AND status='active'", (gw_id,))
+    if not cursor.fetchone():
+        return await message.reply("⚠️ Active Giveaway ID not found. Try again or type /cancel.")
+    
+    await state.update_data(edit_gw_id=gw_id)
+    await state.set_state(EditGiveaway.waiting_for_field)
+    await message.reply(
+        f"🛠 **Editing Giveaway #{gw_id}**\n\nWhat would you like to change?\n"
+        "• Type `time` to extend/change duration\n"
+        "• Type `desc` to change description\n"
+        "• Type `winners` to change max winners count"
+    )
+
+@dp.message(EditGiveaway.waiting_for_field)
+async def process_edit_field(message: Message, state: FSMContext):
+    field = message.text.lower().strip()
+    if field not in ["time", "desc", "winners"]:
+        return await message.reply("⚠️ Invalid choice. Please type `time`, `desc`, or `winners`.")
+    
+    await state.update_data(edit_field=field)
+    await state.set_state(EditGiveaway.waiting_for_new_value)
+    
+    prompts = {
+        "time": "⏳ Send the new duration (e.g., `3 hours` or `45 minutes`):",
+        "desc": "📝 Send the new description text (HTML supported):",
+        "winners": "🏆 Send the new maximum winners number (e.g., `3`):"
+    }
+    await message.reply(prompts[field])
+
+@dp.message(EditGiveaway.waiting_for_new_value)
+async def process_edit_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    gw_id = data["edit_gw_id"]
+    field = data["edit_field"]
+    val = message.text.strip()
+    
+    if field == "time":
+        try:
+            amount = int("".join(filter(str.isdigit, val.lower())))
+            delta = timedelta(minutes=amount) if "m" in val.lower() else timedelta(hours=amount)
+            new_end = (datetime.now() + delta).isoformat()
+            cursor.execute("UPDATE giveaways SET end_time=? WHERE id=?", (new_end, gw_id))
+        except ValueError:
+            return await message.reply("⚠️ Invalid duration format. Try again (e.g., `2 hours`).")
+    elif field == "desc":
+        cursor.execute("UPDATE giveaways SET description=? WHERE id=?", (message.html_text or val, gw_id))
+    elif field == "winners":
+        try:
+            new_wins = int(val)
+            cursor.execute("UPDATE giveaways SET max_winners=? WHERE id=?", (new_wins, gw_id))
+        except ValueError:
+            return await message.reply("⚠️ Please send a valid number for winners.")
+            
     conn.commit()
-    await update_live_messages()
-    await message.reply(apply_premium_emojis(reply_msg), parse_mode="HTML")
+    await state.clear()
+    await update_live_post(gw_id)
+    await message.reply(f"✅ Giveaway #{gw_id} successfully updated!")
 
 
 @dp.message(Command("addstars"))
@@ -561,7 +645,6 @@ async def gw_finalize(message: Message, state: FSMContext):
     conn.commit()
     await state.clear()
 
-    # Determine target chats cleanly
     target_chats = []
     if target.lower() == "all":
         cursor.execute("SELECT DISTINCT chat_id FROM live_messages")
@@ -679,7 +762,6 @@ async def process_repost_target(message: Message, state: FSMContext):
         ]
     )
 
-    # Determine target chats cleanly
     target_chats = []
     if target.lower() == "all":
         cursor.execute("SELECT DISTINCT chat_id FROM live_messages")
@@ -725,69 +807,34 @@ async def process_repost_target(message: Message, state: FSMContext):
     )
 
 
+# --- REDIRECT GIVEAWAY ENTRY TO PM ---
 @dp.callback_query(lambda c: c.data and c.data.startswith("enter_gw_"))
-async def handle_gw_entry(callback_query: CallbackQuery):
+async def handle_gw_entry_redirect(callback_query: CallbackQuery):
     gw_id = int(callback_query.data.split("_")[2])
-    user_id = callback_query.from_user.id
-    username = callback_query.from_user.username or callback_query.from_user.first_name
-
-    cursor.execute("SELECT status, sponsor_channel FROM giveaways WHERE id=?", (gw_id,))
-    gw = cursor.fetchone()
-    if not gw or gw[0] != "active":
-        return await callback_query.answer(
-            "⚠️ This giveaway has ended!", show_alert=True
-        )
-
-    sponsor_channel = gw[1]
-    if sponsor_channel and sponsor_channel.lower() != "none":
-        try:
-            member = await bot.get_chat_member(chat_id=sponsor_channel, user_id=user_id)
-            if member.status in ["left", "kicked", "restricted"]:
-                return await callback_query.answer(
-                    f"⚠️ You must join {sponsor_channel} first to enter!",
-                    show_alert=True,
-                )
-        except Exception:
-            return await callback_query.answer(
-                f"⚠️ You must join {sponsor_channel} first to enter! (Or the bot lacks admin rights there).",
-                show_alert=True,
-            )
-
+    bot_info = await bot.get_me()
+    
+    start_payload = f"https://t.me/{bot_info.username}?start=enter_{gw_id}"
+    
+    # We keep the original button intact while giving an explicit deep-link action button
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Click here to Enter", url=start_payload)],
+            [InlineKeyboardButton(text=callback_query.message.reply_markup.inline_keyboard[0][0].text, callback_data=f"enter_gw_{gw_id}")]
+        ]
+    )
+    
     try:
-        cursor.execute(
-            "INSERT INTO giveaway_entries (giveaway_id, user_id, username, tickets, referrer_id) VALUES (?, ?, ?, 1, NULL)",
-            (gw_id, user_id, username),
-        )
-        conn.commit()
+        await callback_query.message.edit_reply_markup(reply_markup=markup)
+    except Exception:
+        pass
 
-        bot_info = await bot.get_me()
-        ref_link = f"https://t.me/{bot_info.username}?start=ref_{gw_id}_{user_id}"
-
-        try:
-            await bot.send_message(
-                user_id,
-                f"✅ **Entry Recorded!**\n\nTo increase your winning chances, invite people using your unique link:\n`{ref_link}`\n\nCurrent Tickets: **1**",
-                parse_mode="Markdown",
-            )
-            await callback_query.answer(
-                "✅ Entry recorded! Check your DM for your invite link to increase tickets!",
-                show_alert=True,
-            )
-        except TelegramForbiddenError:
-            await callback_query.answer(
-                "✅ Entry recorded! Please DM me directly to get your invite link and increase tickets!",
-                show_alert=True,
-            )
-
-        await update_giveaway_post(gw_id)
-
-    except sqlite3.IntegrityError:
-        await callback_query.answer(
-            "⚠️ You have already entered this giveaway!", show_alert=True
-        )
+    await callback_query.answer(
+        "✨ Tap the button below to register your entry and get your invite link in PM!", 
+        show_alert=True
+    )
 
 
-async def update_giveaway_post(gw_id):
+async def update_live_post(gw_id):
     cursor.execute(
         "SELECT photo_id, description, end_time, max_participants, max_winners, button_text, message_data, status, sponsor_channel FROM giveaways WHERE id=?",
         (gw_id,),
@@ -830,59 +877,105 @@ async def update_giveaway_post(gw_id):
             pass
 
 
+# --- UNIVERSAL /START HANDLER (PM Entry & Referrals) ---
 @dp.message(Command("start"))
 async def handle_start_referral(message: Message):
     args = message.text.split()
-    if len(args) > 1 and args[1].startswith("ref_"):
-        parts = args[1].split("_")
-        gw_id = int(parts[1])
-        referrer_id = int(parts[2])
-        user_id = message.from_user.id
-        username = message.from_user.username or message.from_user.first_name
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.first_name
 
-        if user_id == referrer_id:
-            return await message.reply("⚠️ You cannot refer yourself!")
-
-        cursor.execute("SELECT sponsor_channel FROM giveaways WHERE id=?", (gw_id,))
-        gw = cursor.fetchone()
-
-        if gw and gw[0] and gw[0].lower() != "none":
+    if len(args) > 1:
+        param = args[1]
+        
+        # Handle direct entry via group button redirect
+        if param.startswith("enter_"):
             try:
-                member = await bot.get_chat_member(chat_id=gw[0], user_id=user_id)
-                if member.status in ["left", "kicked", "restricted"]:
-                    return await message.reply(
-                        f"⚠️ You must join {gw[0]} first before using this referral link!"
-                    )
-            except Exception:
-                return await message.reply(
-                    f"⚠️ You must join {gw[0]} first! (Or bot lacks admin rights)."
+                gw_id = int(param.split("_")[1])
+            except ValueError:
+                return await message.reply("⚠️ Invalid giveaway payload.")
+            
+            cursor.execute("SELECT status, sponsor_channel FROM giveaways WHERE id=?", (gw_id,))
+            gw = cursor.fetchone()
+            if not gw or gw[0] != "active":
+                return await message.reply("⚠️ This giveaway has already ended!")
+
+            sponsor_channel = gw[1]
+            if sponsor_channel and sponsor_channel.lower() != "none":
+                try:
+                    member = await bot.get_chat_member(chat_id=sponsor_channel, user_id=user_id)
+                    if member.status in ["left", "kicked", "restricted"]:
+                        return await message.reply(f"⚠️ You must join {sponsor_channel} first to enter this giveaway!")
+                except Exception:
+                    return await message.reply(f"⚠️ You must join {sponsor_channel} first! (Bot lacks admin rights there).")
+
+            bot_info = await bot.get_me()
+            ref_link = f"https://t.me/{bot_info.username}?start=ref_{gw_id}_{user_id}"
+
+            try:
+                cursor.execute(
+                    "INSERT INTO giveaway_entries (giveaway_id, user_id, username, tickets, referrer_id) VALUES (?, ?, ?, 1, NULL)",
+                    (gw_id, user_id, username),
+                )
+                conn.commit()
+                await message.reply(
+                    f"✅ **Entry Recorded Successfully!**\n\n"
+                    f"Share your unique invite link with friends to get extra tickets and boost your winning chances:\n`{ref_link}`\n\n"
+                    f"Current Tickets: **1**",
+                    parse_mode="Markdown"
+                )
+                await update_live_post(gw_id)
+            except sqlite3.IntegrityError:
+                cursor.execute("SELECT tickets FROM giveaway_entries WHERE giveaway_id=? AND user_id=?", (gw_id, user_id))
+                t_row = cursor.fetchone()
+                current_tickets = t_row[0] if t_row else 1
+                await message.reply(
+                    f"⚠️ You have already entered this giveaway!\n\nYour invite link:\n`{ref_link}`\n\nCurrent Tickets: **{current_tickets}**",
+                    parse_mode="Markdown"
                 )
 
-        try:
-            cursor.execute(
-                "INSERT INTO giveaway_entries (giveaway_id, user_id, username, tickets, referrer_id) VALUES (?, ?, ?, 1, ?)",
-                (gw_id, user_id, username, referrer_id),
-            )
-            cursor.execute(
-                "UPDATE giveaway_entries SET tickets = tickets + 1 WHERE giveaway_id=? AND user_id=?",
-                (gw_id, referrer_id),
-            )
-            conn.commit()
-
-            await message.reply(
-                "✅ You successfully entered the giveaway via a referral link!"
-            )
+        # Handle referral links
+        elif param.startswith("ref_"):
+            parts = param.split("_")
             try:
-                await bot.send_message(
-                    referrer_id,
-                    f"🎉 Someone joined using your link! You earned +1 Ticket.",
-                )
-            except Exception:
-                pass
+                gw_id = int(parts[1])
+                referrer_id = int(parts[2])
+            except ValueError:
+                return await message.reply("⚠️ Invalid referral link.")
 
-            await update_giveaway_post(gw_id)
-        except sqlite3.IntegrityError:
-            await message.reply("⚠️ You have already entered this giveaway!")
+            if user_id == referrer_id:
+                return await message.reply("⚠️ You cannot refer yourself!")
+
+            cursor.execute("SELECT sponsor_channel FROM giveaways WHERE id=?", (gw_id,))
+            gw = cursor.fetchone()
+
+            if gw and gw[0] and gw[0].lower() != "none":
+                try:
+                    member = await bot.get_chat_member(chat_id=gw[0], user_id=user_id)
+                    if member.status in ["left", "kicked", "restricted"]:
+                        return await message.reply(f"⚠️ You must join {gw[0]} first before using this referral link!")
+                except Exception:
+                    return await message.reply(f"⚠️ You must join {gw[0]} first!")
+
+            try:
+                cursor.execute(
+                    "INSERT INTO giveaway_entries (giveaway_id, user_id, username, tickets, referrer_id) VALUES (?, ?, ?, 1, ?)",
+                    (gw_id, user_id, username, referrer_id),
+                )
+                cursor.execute(
+                    "UPDATE giveaway_entries SET tickets = tickets + 1 WHERE giveaway_id=? AND user_id=?",
+                    (gw_id, referrer_id),
+                )
+                conn.commit()
+
+                await message.reply("✅ You successfully entered the giveaway via a referral link!")
+                try:
+                    await bot.send_message(referrer_id, "🎉 Someone joined using your link! You earned +1 Ticket.")
+                except Exception:
+                    pass
+
+                await update_live_post(gw_id)
+            except sqlite3.IntegrityError:
+                await message.reply("⚠️ You have already entered this giveaway!")
     else:
         await message.reply(
             "👋 Welcome! Use the buttons in the main groups to enter giveaways."
@@ -922,6 +1015,54 @@ async def cmd_entry(message: Message):
     for u, t in top_refs:
         txt += f"@{u} - {t} Tickets\n"
     await message.reply(txt)
+
+
+# --- AUTO-WINNER SELECTION & OWNER NOTIFICATION ---
+async def auto_select_and_notify_winners(gw_id: int):
+    cursor.execute("SELECT user_id, username, tickets FROM giveaway_entries WHERE giveaway_id=?", (gw_id,))
+    entries = cursor.fetchall()
+    
+    if not entries:
+        try:
+            await bot.send_message(OWNER_ID, f"⚠️ Giveaway #{gw_id} ended, but there were no participants.")
+        except Exception:
+            pass
+        return
+
+    cursor.execute("SELECT max_winners FROM giveaways WHERE id=?", (gw_id,))
+    res = cursor.fetchone()
+    max_winners = res[0] if res else 1
+
+    pool = []
+    for user_id, username, tickets in entries:
+        for _ in range(max(1, tickets)):
+            pool.append((user_id, username))
+            
+    random.shuffle(pool)
+    
+    chosen_winners = []
+    seen_users = set()
+    for uid, uname in pool:
+        if uid not in seen_users:
+            seen_users.add(uid)
+            chosen_winners.append(f"@{uname}" if uname else f"User {uid}")
+            if len(chosen_winners) >= max_winners:
+                break
+
+    winners_str = " ".join(chosen_winners)
+    
+    cursor.execute("UPDATE giveaways SET status='ended' WHERE id=?", (gw_id,))
+    conn.commit()
+
+    notification_text = (
+        f"🤖 **Auto-Winner Selection for Giveaway #{gw_id}**\n\n"
+        f"Selected Winners:\n`{winners_str}`\n\n"
+        f"To announce this in groups, use:\n`/winner {gw_id} {winners_str}`"
+    )
+    try:
+        await bot.send_message(OWNER_ID, notification_text, parse_mode="Markdown")
+    except Exception:
+        pass
 
 
 @dp.message(Command("winner"))
