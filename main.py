@@ -20,7 +20,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from keep_alive import keep_alive[cite: 2]
+from keep_alive import keep_alive
 
 BOT_TOKEN = os.environ.get(
     "BOT_TOKEN", "8488349023:AAG75msvlzTzeFbgXe4_8SnHldKEycgfLq8"
