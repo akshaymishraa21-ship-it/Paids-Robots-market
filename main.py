@@ -340,35 +340,40 @@ async def reset_database(message: Message):
     )
 
 
-# --- INTERACTIVE GIVEAWAY EDIT COMMAND ---
+# --- ORIGINAL LEADERBOARD EDIT COMMAND ---
 @dp.message(Command("edit"))
+async def edit_spenders(message: Message):
+    if not is_admin(message.from_user):
+        return
+    parts = message.text.split()
+    if len(parts) != 3:
+        return await message.reply("⚠️ Usage: /edit @username new_amount")
+    username = parts[1].replace("@", "")
+    try:
+        new_amount = int(parts[2])
+    except ValueError:
+        return await message.reply("⚠️ Amount must be a number.")
+
+    cursor.execute("DELETE FROM spenders WHERE LOWER(username)=?", (username.lower(),))
+    if new_amount > 0:
+        cursor.execute(
+            "INSERT INTO spenders (user_id, username, stars, timestamp) VALUES (?, ?, ?, ?)",
+            (0, username, new_amount, datetime.now()),
+        )
+        reply_msg = f"✅ Set @{username}'s total to {new_amount} Stars!"
+    else:
+        reply_msg = f"🗑 Removed @{username} from the leaderboard entirely."
+    conn.commit()
+    await update_live_messages()
+    await message.reply(apply_premium_emojis(reply_msg), parse_mode="HTML")
+
+
+# --- NEW INTERACTIVE GIVEAWAY EDIT COMMAND (/editgw) ---
+@dp.message(Command("editgw"))
 async def cmd_edit_giveaway(message: Message, state: FSMContext):
     if not is_admin(message.from_user): 
         return
     
-    parts = message.text.split()
-    # Support legacy leaderboard edit if 3 arguments are passed (/edit @username amount)
-    if len(parts) == 3 and parts[1].startswith("@"):
-        username = parts[1].replace("@", "")
-        try:
-            new_amount = int(parts[2])
-        except ValueError:
-            return await message.reply("⚠️ Amount must be a number.")
-
-        cursor.execute("DELETE FROM spenders WHERE LOWER(username)=?", (username.lower(),))
-        if new_amount > 0:
-            cursor.execute(
-                "INSERT INTO spenders (user_id, username, stars, timestamp) VALUES (?, ?, ?, ?)",
-                (0, username, new_amount, datetime.now()),
-            )
-            reply_msg = f"✅ Set @{username}'s total to {new_amount} Stars!"
-        else:
-            reply_msg = f"🗑 Removed @{username} from the leaderboard entirely."
-        conn.commit()
-        await update_live_messages()
-        return await message.reply(apply_premium_emojis(reply_msg), parse_mode="HTML")
-
-    # Otherwise, interactive giveaway edit wizard
     cursor.execute("SELECT id, description, status FROM giveaways WHERE status='active'")
     gws = cursor.fetchall()
     if not gws:
@@ -815,7 +820,6 @@ async def handle_gw_entry_redirect(callback_query: CallbackQuery):
     
     start_payload = f"https://t.me/{bot_info.username}?start=enter_{gw_id}"
     
-    # We keep the original button intact while giving an explicit deep-link action button
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🚀 Click here to Enter", url=start_payload)],
@@ -887,7 +891,6 @@ async def handle_start_referral(message: Message):
     if len(args) > 1:
         param = args[1]
         
-        # Handle direct entry via group button redirect
         if param.startswith("enter_"):
             try:
                 gw_id = int(param.split("_")[1])
@@ -933,7 +936,6 @@ async def handle_start_referral(message: Message):
                     parse_mode="Markdown"
                 )
 
-        # Handle referral links
         elif param.startswith("ref_"):
             parts = param.split("_")
             try:
