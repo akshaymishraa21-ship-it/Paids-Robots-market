@@ -6,7 +6,7 @@ import html
 import random
 import json
 from datetime import datetime, timedelta
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message,
     ErrorEvent,
@@ -108,7 +108,7 @@ def init_db():
 init_db()
 
 
-# FSM States
+# FSM States (Removed TopupAdmin to fix DM sync issue)
 class MakePost(StatesGroup):
     waiting_for_paragraph = State()
 
@@ -130,9 +130,6 @@ class EditGiveaway(StatesGroup):
     waiting_for_id = State()
     waiting_for_field = State()
     waiting_for_new_value = State()
-
-class TopupAdmin(StatesGroup):
-    waiting_for_amount = State()
 
 class WithdrawFlow(StatesGroup):
     waiting_for_wallet = State()
@@ -634,11 +631,11 @@ async def process_withdraw_wallet(message: Message, state: FSMContext):
     await message.reply(notif_msg, parse_mode="Markdown")
 
 
-# Memory storage to track where topup was invoked
-topup_invocation_context = {}
+# CUSTOM DICTIONARY TO TRACK ADMIN TOPUP ACROSS CHATS (Replaces buggy FSM across DM)
+admin_pending_topups = {}
 
 @dp.message(Command("topup"))
-async def cmd_topup(message: Message, state: FSMContext):
+async def cmd_topup(message: Message):
     if is_admin(message.from_user):
         parts = message.text.split(maxsplit=1)
         target_uid = None
@@ -655,27 +652,31 @@ async def cmd_topup(message: Message, state: FSMContext):
                 target_uname = row[1]
             else:
                 target_uname = target_query
-
-        # Save the exact chat ID where /topup was called so the notification goes back there
-        topup_invocation_context[message.from_user.id] = {
+        
+        # Save cross-chat context safely
+        admin_pending_topups[message.from_user.id] = {
             "chat_id": message.chat.id,
             "target_id": target_uid,
             "target_uname": target_uname
         }
 
-        # If typed in a group, send prompt to DM and clean group message
         if message.chat.type != "private":
             try:
-                await bot.send_message(OWNER_ID, "💵 How much would you like to top up? (Reply with amount):")
-                await message.reply("✅ Top-up deposit prompt sent to your private DM!")
+                if target_uname:
+                    await bot.send_message(message.from_user.id, f"💵 **Admin Topup**\nTarget: @{target_uname}\n\nHow much would you like to top up? (Reply with amount here in DM):")
+                else:
+                    await bot.send_message(message.from_user.id, "💵 **Admin Topup**\nHow much would you like to top up for yourself? (Reply with amount here in DM):")
+                
+                await message.reply("✅ Admin top-up prompt sent to your private DM!")
             except Exception:
                 await message.reply("⚠️ Please start the bot in private DM first so it can message you securely.")
         else:
-            await message.answer("💵 How much would you like to top up? (Reply with amount):")
-
-        await state.set_state(TopupAdmin.waiting_for_amount)
+            if target_uname:
+                await message.answer(f"💵 **Admin Topup**\nTarget: @{target_uname}\n\nHow much would you like to top up? (Reply with amount here in DM):")
+            else:
+                await message.answer("💵 **Admin Topup**\nHow much would you like to top up for yourself? (Reply with amount):")
     else:
-        # Standard user public instructions
+        # Standard user public instructions (NO FSM, NO ADMIN PROMPTS)
         await message.reply(
             "💳 **Top Up Instructions:**\n"
             "Please send the exact money within a few seconds to:\n"
@@ -685,12 +686,9 @@ async def cmd_topup(message: Message, state: FSMContext):
         )
 
 
-@dp.message(TopupAdmin.waiting_for_amount)
-async def process_admin_topup(message: Message, state: FSMContext):
-    if not is_admin(message.from_user):
-        await state.clear()
-        return
-
+# Catch the admin's numerical reply in DM cleanly without FSM bugs
+@dp.message(lambda m: m.chat.type == "private" and is_admin(m.from_user) and m.from_user.id in admin_pending_topups)
+async def process_admin_topup_dm(message: Message):
     val = message.text.strip()
     try:
         amount = float("".join(filter(lambda c: c.isdigit() or c == '.', val)))
@@ -700,10 +698,10 @@ async def process_admin_topup(message: Message, state: FSMContext):
     admin_id = message.from_user.id
     admin_uname = message.from_user.username or message.from_user.first_name
 
-    ctx = topup_invocation_context.pop(admin_id, {})
+    ctx = admin_pending_topups.pop(admin_id)
     target_id = ctx.get("target_id")
     target_uname = ctx.get("target_uname")
-    target_chat_id = ctx.get("chat_id", message.chat.id)
+    target_chat_id = ctx.get("chat_id")
 
     conn, cursor = get_db()
     if target_id:
@@ -735,13 +733,14 @@ async def process_admin_topup(message: Message, state: FSMContext):
         u_name = admin_uname
 
     conn.close()
-    await state.clear()
 
     verified_emoji_html = '<tg-emoji emoji-id="5850633746583129853">✅</tg-emoji>'
     success_msg = f"@{u_name} money received and balance is increased to ${new_bal:.2f} {verified_emoji_html}\nTotal Balance: **${new_bal:.2f}**"
 
     try:
         await bot.send_message(target_chat_id, success_msg, parse_mode="HTML")
+        if target_chat_id != message.chat.id:
+            await message.reply(f"✅ Notification successfully sent to group!")
     except Exception:
         await message.answer(success_msg, parse_mode="HTML")
 
@@ -771,8 +770,9 @@ async def cmd_wager(message: Message):
     await message.reply(stats_text, parse_mode="Markdown")
 
 
+# Live tracking storage for pending challenges and live emoji rolls
 active_dice_battles = {}
-active_turn_battles = {}
+live_matches = {}
 
 @dp.message(Command("dice"))
 async def cmd_dice(message: Message, state: FSMContext):
@@ -822,19 +822,18 @@ async def cmd_dice(message: Message, state: FSMContext):
         markup = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="Yes", callback_data=f"dice_accept_{battle_id}"),
-                    InlineKeyboardButton(text="No", callback_data=f"dice_decline_{battle_id}")
+                    InlineKeyboardButton(text="🔵 Yes", callback_data=f"dice_accept_{battle_id}"),
+                    InlineKeyboardButton(text="🔴 No", callback_data=f"dice_decline_{battle_id}")
                 ]
             ]
         )
 
         challenge_msg = (
-            f"🤝 <b>@{target_uname}</b> challenge you with 🎯 emoji for 1v1 for <b>${wager:.2f}</b>!\n\n"
-            f"Challenger: <b>@{user_uname}</b>"
+            f"🤝 <b>@{target_uname}</b>, <b>@{user_uname}</b> challenge you with 🎯 emoji for 1v1 for <b>${wager:.2f}</b>!\n\n"
         )
         await message.reply(challenge_msg, reply_markup=markup, parse_mode="HTML")
     else:
-        # Solo vs Bot
+        # Solo vs Bot (Requires FSM for amount since there's no reply structure)
         await state.set_state(DiceGameFlow.waiting_for_amount)
         await message.reply(f"🎲 **Dice Battle Game**\nYou have **${balance:.2f}** in your wallet.\n\nHow much would you like to wager against the bot?", parse_mode="Markdown")
 
@@ -849,48 +848,42 @@ async def process_solo_dice_wager(message: Message, state: FSMContext):
 
     user_id = message.from_user.id
     user_uname = message.from_user.username or message.from_user.first_name
+    chat_id = message.chat.id
 
     conn, cursor = get_db()
     cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (user_id,))
     row = cursor.fetchone()
+    conn.close()
     balance = row[0] if row else 0.0
 
     if wager > balance:
-        conn.close()
         return await message.reply(f"❌ You cannot wager ${wager:.2f}. Your balance is only ${balance:.2f}.")
 
     await state.clear()
 
+    # Solo vs Bot: Bot rolls first, then waits for User to send emoji physically
     sent_dice = await message.answer_dice(emoji="🎲")
-    user_roll = sent_dice.dice.value
+    bot_roll = sent_dice.dice.value
+    
+    if chat_id not in live_matches:
+        live_matches[chat_id] = {}
+        
+    live_matches[chat_id][user_id] = {
+        "type": "solo",
+        "wager": wager,
+        "bot_roll": bot_roll,
+        "user_uname": user_uname
+    }
 
-    bot_dice = await message.answer_dice(emoji="🎲")
-    bot_roll = bot_dice.dice.value
-
-    result_text = f"🎲 **Dice Battle Result**:\n\n👤 <b>{user_uname}</b> Roll: `{user_roll}`\n🤖 Bot Roll: `{bot_roll}`\n\n"
-
-    if user_roll > bot_roll:
-        cursor.execute("UPDATE user_balances SET balance = balance + ? WHERE user_id=?", (wager, user_id))
-        cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, ?, 0.0) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1, total_won = total_won + ?", (user_id, user_uname, wager, wager))
-        result_text += f"🎉 **You Won!** You gained **+${wager:.2f}**!"
-    elif user_roll < bot_roll:
-        cursor.execute("UPDATE user_balances SET balance = balance - ? WHERE user_id=?", (wager, user_id))
-        cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, 0.0, ?) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1, total_lost = total_lost + ?", (user_id, user_uname, wager, wager))
-        result_text += f"😢 **You Lost!** You lost **-${wager:.2f}**."
-    else:
-        cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, 0.0, 0.0) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1", (user_id, user_uname))
-        result_text += "🤝 **It's a Tie!** Your wager was returned."
-
-    conn.commit()
-    cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (user_id,))
-    new_bal = cursor.fetchone()[0]
-    conn.close()
-
-    result_text += f"\n\n💳 New Balance: **${new_bal:.2f}**"
-    await message.reply(result_text, parse_mode="Markdown")
+    await message.answer(
+        f"🎲 I rolled a `{bot_roll}`!\n\n"
+        f"Now your turn <b>@{user_uname}</b>, send a 🎲 emoji to the chat to roll against me!", 
+        parse_mode="HTML"
+    )
 
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("dice_"))
+# Safely handles button clicks natively in Aiogram V3
+@dp.callback_query(F.data.startswith("dice_"))
 async def handle_dice_challenge_callback(callback_query: CallbackQuery):
     data_parts = callback_query.data.split("_")
     action = data_parts[1]
@@ -902,6 +895,7 @@ async def handle_dice_challenge_callback(callback_query: CallbackQuery):
     battle = active_dice_battles[battle_id]
     user_id = callback_query.from_user.id
     user_uname = callback_query.from_user.username or callback_query.from_user.first_name
+    chat_id = callback_query.message.chat.id
 
     if user_id != battle["opponent_id"]:
         return await callback_query.answer("❌ This challenge is not for you!", show_alert=True)
@@ -925,122 +919,136 @@ async def handle_dice_challenge_callback(callback_query: CallbackQuery):
         del active_dice_battles[battle_id]
         return await callback_query.message.edit_text("❌ Challenge failed: One of the players no longer has enough balance to cover the wager!")
 
-    turn_id = f"turn_{int(datetime.now().timestamp())}"
-    active_turn_battles[turn_id] = {
-        "challenger_id": battle["challenger_id"],
-        "challenger_uname": battle["challenger_uname"],
-        "opponent_id": battle["opponent_id"],
-        "opponent_uname": battle["opponent_uname"],
+    # Start live emoji monitoring for this match in this chat
+    if chat_id not in live_matches:
+        live_matches[chat_id] = {}
+        
+    live_matches[chat_id][battle["challenger_id"]] = {
+        "type": "1v1",
         "wager": battle["wager"],
-        "challenger_roll": None,
-        "opponent_roll": None,
-        "current_turn": battle["challenger_id"]
+        "c_id": battle["challenger_id"],
+        "c_uname": battle["challenger_uname"],
+        "o_id": battle["opponent_id"],
+        "o_uname": battle["opponent_uname"],
+        "c_roll": None,
+        "o_roll": None,
+        "current_turn": battle["challenger_id"] # Challenger must throw emoji first
     }
+    # Link opponent to the same match logic
+    live_matches[chat_id][battle["opponent_id"]] = live_matches[chat_id][battle["challenger_id"]]
+    
     del active_dice_battles[battle_id]
-
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🎲 Roll Dice", callback_data=f"roll_turn_{turn_id}")]]
-    )
 
     await callback_query.message.edit_text(
         f"✅ <b>@{user_uname}</b> accepted the challenge!\n\n"
-        f"🎯 It's <b>@{battle['challenger_uname']}</b>'s turn to throw dice 🎲. Tap below!",
-        reply_markup=markup,
+        f"🎯 <b>@{battle['challenger_uname']}</b>, it's your turn. Send a 🎲 emoji to the chat!",
         parse_mode="HTML"
     )
     await callback_query.answer("Match started!")
 
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("roll_turn_"))
-async def handle_turn_roll(callback_query: CallbackQuery):
-    turn_id = callback_query.data.split("_")[2] + "_" + callback_query.data.split("_")[3]
-    if turn_id not in active_turn_battles:
-        return await callback_query.answer("⚠️ This battle session has expired.", show_alert=True)
-
-    battle = active_turn_battles[turn_id]
-    user_id = callback_query.from_user.id
-    user_uname = callback_query.from_user.username or callback_query.from_user.first_name
-
-    if user_id != battle["current_turn"]:
-        return await callback_query.answer("⏳ It is not your turn to throw dice yet!", show_alert=True)
-
-    sent_dice = await callback_query.message.answer_dice(emoji="🎲")
-    roll_val = sent_dice.dice.value
-
-    if user_id == battle["challenger_id"]:
-        battle["challenger_roll"] = roll_val
-        battle["current_turn"] = battle["opponent_id"]
-
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🎲 Roll Dice", callback_data=f"roll_turn_{turn_id}")]]
-        )
-        await callback_query.message.answer(
-            f"🎲 <b>@{battle['challenger_uname']}</b> threw dice 🎲 and got `{roll_val}`!\n\n"
-            f"Now <b>@{battle['opponent_uname']}</b>, it's your turn to throw dice 🎲. Tap below!",
-            reply_markup=markup,
-            parse_mode="HTML"
-        )
-        try:
-            await callback_query.message.delete()
-        except Exception:
-            pass
-    else:
-        battle["opponent_roll"] = roll_val
-        c_id = battle["challenger_id"]
-        c_uname = battle["challenger_uname"]
-        c_roll = battle["challenger_roll"]
-
-        o_id = battle["opponent_id"]
-        o_uname = battle["opponent_uname"]
-        o_roll = battle["opponent_roll"]
-        wager = battle["wager"]
-
-        del active_turn_battles[turn_id]
-
+# Safely captures whenever a user natively sends a dice emoji in the chat
+@dp.message(F.dice)
+async def handle_user_real_dice(message: Message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    
+    if chat_id not in live_matches or user_id not in live_matches[chat_id]:
+        return
+        
+    match = live_matches[chat_id][user_id]
+    
+    # Must be standard dice, not dart/basketball/etc
+    if message.dice.emoji != "🎲":
+        return
+        
+    user_roll = message.dice.value
+    
+    if match["type"] == "solo":
+        bot_roll = match["bot_roll"]
+        wager = match["wager"]
+        user_uname = match["user_uname"]
+        del live_matches[chat_id][user_id]
+        
         conn, cursor = get_db()
-        cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (c_id,))
-        c_bal = cursor.fetchone()[0]
-        cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (o_id,))
-        o_bal = cursor.fetchone()[0]
+        result_text = f"🎲 **Dice Battle Result**:\n\n👤 <b>@{user_uname}</b> Roll: `{user_roll}`\n🤖 Bot Roll: `{bot_roll}`\n\n"
 
-        result_msg = f"🎲 **1v1 Dice Battle Final Outcome**:\n\n⚔️ <b>@{c_uname}</b>: `{c_roll}`\n🛡️ <b>@{o_uname}</b>: `{o_roll}`\n\n"
-
-        if c_roll > o_roll:
-            cursor.execute("UPDATE user_balances SET balance = balance + ? WHERE user_id=?", (wager, c_id))
-            cursor.execute("UPDATE user_balances SET balance = balance - ? WHERE user_id=?", (wager, o_id))
-
-            cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, ?, 0.0) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1, total_won = total_won + ?", (c_id, c_uname, wager, wager))
-            cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, 0.0, ?) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1, total_lost = total_lost + ?", (o_id, o_uname, wager, wager))
-
-            result_msg += f"🏆 <b>@{c_uname} won the battle!</b>\n💰 @{c_uname} won **+${wager:.2f}**\n💸 @{o_uname} lost **-${wager:.2f}**"
-        elif o_roll > c_roll:
-            cursor.execute("UPDATE user_balances SET balance = balance - ? WHERE user_id=?", (wager, c_id))
-            cursor.execute("UPDATE user_balances SET balance = balance + ? WHERE user_id=?", (wager, o_id))
-
-            cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, 0.0, ?) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1, total_lost = total_lost + ?", (c_id, c_uname, wager, wager))
-            cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, ?, 0.0) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1, total_won = total_won + ?", (o_id, o_uname, wager, wager))
-
-            result_msg += f"🏆 <b>@{o_uname} won the battle!</b>\n💰 @{o_uname} won **+${wager:.2f}**\n💸 @{c_uname} lost **-${wager:.2f}**"
+        if user_roll > bot_roll:
+            cursor.execute("UPDATE user_balances SET balance = balance + ? WHERE user_id=?", (wager, user_id))
+            cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, ?, 0.0) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1, total_won = total_won + ?", (user_id, user_uname, wager, wager))
+            result_text += f"🎉 **You Won!** You gained **+${wager:.2f}**!"
+        elif user_roll < bot_roll:
+            cursor.execute("UPDATE user_balances SET balance = balance - ? WHERE user_id=?", (wager, user_id))
+            cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, 0.0, ?) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1, total_lost = total_lost + ?", (user_id, user_uname, wager, wager))
+            result_text += f"😢 **You Lost!** You lost **-${wager:.2f}**."
         else:
-            cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, 0.0, 0.0) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1", (c_id, c_uname))
-            cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, 0.0, 0.0) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1", (o_id, o_uname))
-            result_msg += "🤝 **It's a Tie!** Wagers were returned to both players."
+            cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, 0.0, 0.0) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1", (user_id, user_uname))
+            result_text += "🤝 **It's a Tie!** Your wager was returned."
 
         conn.commit()
-        cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (c_id,))
-        new_c_bal = cursor.fetchone()[0]
-        cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (o_id,))
-        new_o_bal = cursor.fetchone()[0]
+        cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (user_id,))
+        new_bal = cursor.fetchone()[0]
         conn.close()
 
-        result_msg += f"\n\n💳 @{c_uname} Balance: **${new_c_bal:.2f}**\n💳 @{o_uname} Balance: **${new_o_bal:.2f}**"
-        await callback_query.message.answer(result_msg, parse_mode="HTML")
-        try:
-            await callback_query.message.delete()
-        except Exception:
-            pass
+        result_text += f"\n\n💳 New Balance: **${new_bal:.2f}**"
+        await message.reply(result_text, parse_mode="HTML")
+        
+    elif match["type"] == "1v1":
+        if match["current_turn"] != user_id:
+            return # Ignore if it's the other player's turn to throw
+            
+        if user_id == match["c_id"]:
+            match["c_roll"] = user_roll
+            match["current_turn"] = match["o_id"]
+            await message.reply(
+                f"🎲 <b>@{match['c_uname']}</b> rolled a `{user_roll}`!\n\n"
+                f"Now <b>@{match['o_uname']}</b>, send a 🎲 emoji to the chat to roll!",
+                parse_mode="HTML"
+            )
+        else:
+            match["o_roll"] = user_roll
+            c_id, o_id = match["c_id"], match["o_id"]
+            c_uname, o_uname = match["c_uname"], match["o_uname"]
+            c_roll, o_roll = match["c_roll"], match["o_roll"]
+            wager = match["wager"]
+            
+            # Match is complete. Clear from memory cleanly.
+            del live_matches[chat_id][c_id]
+            del live_matches[chat_id][o_id]
+            
+            conn, cursor = get_db()
+            result_msg = f"🎲 **1v1 Dice Battle Final Outcome**:\n\n⚔️ <b>@{c_uname}</b>: `{c_roll}`\n🛡️ <b>@{o_uname}</b>: `{o_roll}`\n\n"
 
-    await callback_query.answer()
+            if c_roll > o_roll:
+                cursor.execute("UPDATE user_balances SET balance = balance + ? WHERE user_id=?", (wager, c_id))
+                cursor.execute("UPDATE user_balances SET balance = balance - ? WHERE user_id=?", (wager, o_id))
+
+                cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, ?, 0.0) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1, total_won = total_won + ?", (c_id, c_uname, wager, wager))
+                cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, 0.0, ?) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1, total_lost = total_lost + ?", (o_id, o_uname, wager, wager))
+
+                result_msg += f"🏆 <b>@{c_uname} won the battle!</b>\n💰 @{c_uname} won **+${wager:.2f}**\n💸 @{o_uname} lost **-${wager:.2f}**"
+            elif o_roll > c_roll:
+                cursor.execute("UPDATE user_balances SET balance = balance - ? WHERE user_id=?", (wager, c_id))
+                cursor.execute("UPDATE user_balances SET balance = balance + ? WHERE user_id=?", (wager, o_id))
+
+                cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, 0.0, ?) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1, total_lost = total_lost + ?", (c_id, c_uname, wager, wager))
+                cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, ?, 0.0) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1, total_won = total_won + ?", (o_id, o_uname, wager, wager))
+
+                result_msg += f"🏆 <b>@{o_uname} won the battle!</b>\n💰 @{o_uname} won **+${wager:.2f}**\n💸 @{c_uname} lost **-${wager:.2f}**"
+            else:
+                cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, 0.0, 0.0) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1", (c_id, c_uname))
+                cursor.execute("INSERT INTO wager_stats (user_id, username, games_played, total_won, total_lost) VALUES (?, ?, 1, 0.0, 0.0) ON CONFLICT(user_id) DO UPDATE SET games_played = games_played + 1", (o_id, o_uname))
+                result_msg += "🤝 **It's a Tie!** Wagers were returned to both players."
+
+            conn.commit()
+            cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (c_id,))
+            new_c_bal = cursor.fetchone()[0]
+            cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (o_id,))
+            new_o_bal = cursor.fetchone()[0]
+            conn.close()
+
+            result_msg += f"\n\n💳 @{c_uname} Balance: **${new_c_bal:.2f}**\n💳 @{o_uname} Balance: **${new_o_bal:.2f}**"
+            await message.reply(result_msg, parse_mode="HTML")
 
 
 @dp.message(Command("guys"))
