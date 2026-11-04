@@ -634,38 +634,47 @@ async def process_withdraw_wallet(message: Message, state: FSMContext):
     await message.reply(notif_msg, parse_mode="Markdown")
 
 
+# Stored globally so the bot remembers where the /topup command was invoked from
+topup_invocation_context = {}
+
 @dp.message(Command("topup"))
 async def cmd_topup(message: Message, state: FSMContext):
     if is_admin(message.from_user):
         parts = message.text.split(maxsplit=1)
+        target_uid = None
+        target_uname = None
+
         if len(parts) > 1:
             target_query = parts[1].strip().replace("@", "")
             conn, cursor = get_db()
             cursor.execute("SELECT user_id, username FROM user_balances WHERE LOWER(username)=? OR user_id=?", (target_query.lower(), target_query if target_query.isdigit() else 0))
             row = cursor.fetchone()
             conn.close()
-            if not row:
-                return await message.reply("⚠️ User not found in database balances.")
-            
-            await state.update_data(topup_target_id=row[0], topup_target_uname=row[1])
-            await state.set_state(TopupAdmin.waiting_for_amount)
+            if row:
+                target_uid = row[0]
+                target_uname = row[1]
+            else:
+                target_uname = target_query
+
+        # Save invocation chat and target info
+        topup_invocation_context[message.from_user.id] = {
+            "chat_id": message.chat.id,
+            "target_id": target_uid,
+            "target_uname": target_uname
+        }
+
+        if message.chat.type != "private":
             try:
-                await bot.send_message(OWNER_ID, f"💵 **Admin Topup Control Panel**\nTarget User: @{row[1]}\nHow much balance would you like to deposit? (Reply with the amount):")
-                if message.chat.type != "private":
-                    await message.reply("✅ Admin deposit prompt sent to your private DM!")
+                await bot.send_message(OWNER_ID, "💵 How much would you like to top up? (Reply with amount):")
+                await message.reply("✅ Admin top-up prompt sent to your private DM!")
             except Exception:
-                await message.reply("⚠️ Please start the bot in PM first so it can message you securely.")
+                await message.reply("⚠️ Please start the bot in private DM first so it can message you securely.")
         else:
-            await state.update_data(topup_target_id=None, topup_target_uname=None)
-            await state.set_state(TopupAdmin.waiting_for_amount)
-            try:
-                await bot.send_message(OWNER_ID, "💵 **Admin Topup Control Panel**\nHow much balance would you like to deposit for yourself? (Reply with the amount):")
-                if message.chat.type != "private":
-                    await message.reply("✅ Admin deposit prompt sent to your private DM!")
-            except Exception:
-                await message.reply("⚠️ Please start the bot in PM first so it can message you securely.")
+            await message.answer("💵 How much would you like to top up? (Reply with amount):")
+
+        await state.set_state(TopupAdmin.waiting_for_amount)
     else:
-        # Regular user public instructions
+        # Public instruction for normal users
         await message.reply(
             "💳 **Top Up Instructions:**\n"
             "Please send the exact money within a few seconds to:\n"
@@ -680,17 +689,21 @@ async def process_admin_topup(message: Message, state: FSMContext):
     if not is_admin(message.from_user):
         await state.clear()
         return
-        
+
     val = message.text.strip()
     try:
         amount = float("".join(filter(lambda c: c.isdigit() or c == '.', val)))
     except ValueError:
         return await message.reply("⚠️ Please send a valid number.")
-        
-    data = await state.get_data()
-    target_id = data.get("topup_target_id")
-    target_uname = data.get("topup_target_uname")
-    
+
+    admin_id = message.from_user.id
+    admin_uname = message.from_user.username or message.from_user.first_name
+
+    ctx = topup_invocation_context.pop(admin_id, {})
+    target_id = ctx.get("target_id")
+    target_uname = ctx.get("target_uname")
+    target_chat_id = ctx.get("chat_id", admin_id)
+
     conn, cursor = get_db()
     if target_id:
         cursor.execute("SELECT username, balance FROM user_balances WHERE user_id=?", (target_id,))
@@ -700,26 +713,39 @@ async def process_admin_topup(message: Message, state: FSMContext):
         conn.commit()
         cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (target_id,))
         new_bal = cursor.fetchone()[0]
-        conn.close()
-        
-        await state.clear()
-        success_msg = f"@{u_name} money received and balance is increased to ${new_bal:.2f} <tg-emoji emoji-id=\"5850633746583129853\">✅</tg-emoji>\nTotal Balance: **${new_bal:.2f}**"
-        await message.answer(success_msg, parse_mode="HTML")
+    elif target_uname:
+        cursor.execute("SELECT user_id, balance FROM user_balances WHERE LOWER(username)=?", (target_uname.lower(),))
+        row = cursor.fetchone()
+        if row:
+            target_id = row[0]
+            cursor.execute("UPDATE user_balances SET balance = balance + ? WHERE user_id=?", (amount, target_id))
+        else:
+            cursor.execute("INSERT INTO user_balances (user_id, username, balance) VALUES (0, ?, ?)", (target_uname, amount))
+        conn.commit()
+        cursor.execute("SELECT balance FROM user_balances WHERE LOWER(username)=? OR user_id=?", (target_uname.lower(), target_id or 0))
+        r2 = cursor.fetchone()
+        new_bal = r2[0] if r2 else amount
+        u_name = target_uname
     else:
-        admin_id = message.from_user.id
-        admin_uname = message.from_user.username or message.from_user.first_name
         cursor.execute("INSERT INTO user_balances (user_id, username, balance) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET balance = balance + ?", (admin_id, admin_uname, amount, amount))
         conn.commit()
         cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (admin_id,))
         new_bal = cursor.fetchone()[0]
-        conn.close()
-        
-        await state.clear()
-        success_msg = f"@{admin_uname} money received and balance is increased to ${new_bal:.2f} <tg-emoji emoji-id=\"5850633746583129853\">✅</tg-emoji>\nTotal Balance: **${new_bal:.2f}**"
+        u_name = admin_uname
+
+    conn.close()
+    await state.clear()
+
+    verified_emoji_html = '<tg-emoji emoji-id="5850633746583129853">✅</tg-emoji>'
+    success_msg = f"@{u_name} money received and balance is increased to ${new_bal:.2f} {verified_emoji_html}\nTotal Balance: **${new_bal:.2f}**"
+
+    try:
+        await bot.send_message(target_chat_id, success_msg, parse_mode="HTML")
+    except Exception:
         await message.answer(success_msg, parse_mode="HTML")
 
 
-# --- 1V1 BUTTON CHALLENGE & WAGER STATS ---
+# --- WAGER STATS & 1V1 DICE BATTLE ---
 @dp.message(Command("wager"))
 async def cmd_wager(message: Message):
     user_id = message.from_user.id
@@ -744,8 +770,9 @@ async def cmd_wager(message: Message):
     await message.reply(stats_text, parse_mode="Markdown")
 
 
-# Active 1v1 battles storage
+# Active 1v1 challenges and live turn matches
 active_dice_battles = {}
+active_turn_battles = {}
 
 @dp.message(Command("dice"))
 async def cmd_dice(message: Message, state: FSMContext):
@@ -761,7 +788,7 @@ async def cmd_dice(message: Message, state: FSMContext):
     if balance <= 0:
         return await message.reply("❌ You need a balance greater than $0 to play the dice game!")
 
-    # Check if replying to someone for 1v1 battle with wager (e.g. /dice 2)
+    # Check if replying to another user with a wager amount (e.g., /dice 1 or /dice 2)
     if message.reply_to_message and message.reply_to_message.from_user:
         target_user = message.reply_to_message.from_user
         if target_user.id == user_id:
@@ -789,23 +816,21 @@ async def cmd_dice(message: Message, state: FSMContext):
             "challenger_uname": user_uname,
             "opponent_id": target_user.id,
             "opponent_uname": target_uname,
-            "wager": wager,
-            "status": "pending"
+            "wager": wager
         }
 
         markup = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="✅ Yes", callback_data=f"dice_accept_{battle_id}"),
-                    InlineKeyboardButton(text="❌ No", callback_data=f"dice_decline_{battle_id}")
+                    InlineKeyboardButton(text="Yes", callback_data=f"dice_accept_{battle_id}"),
+                    InlineKeyboardButton(text="No", callback_data=f"dice_decline_{battle_id}")
                 ]
             ]
         )
 
         challenge_msg = (
-            f"⚔️ <b>@{target_uname}</b>, you were challenged by <b>@{user_uname}</b> 🎯 "
-            f"to a 1v1 Dice Battle for <b>${wager:.2f}</b>!\n\n"
-            f"Do you accept?"
+            f"🤝 <b>@{target_uname}</b> challenge you with 🎯 emoji for 1v1 for <b>${wager:.2f}</b>!\n\n"
+            f"Challenger: <b>@{user_uname}</b>"
         )
         await message.reply(challenge_msg, reply_markup=markup, parse_mode="HTML")
     else:
@@ -865,9 +890,6 @@ async def process_solo_dice_wager(message: Message, state: FSMContext):
     await message.reply(result_text, parse_mode="Markdown")
 
 
-# Active 1v1 turn state storage
-active_turn_battles = {}
-
 @dp.callback_query(lambda c: c.data and c.data.startswith("dice_"))
 async def handle_dice_challenge_callback(callback_query: CallbackQuery):
     data_parts = callback_query.data.split("_")
@@ -889,7 +911,6 @@ async def handle_dice_challenge_callback(callback_query: CallbackQuery):
         await callback_query.message.edit_text(f"❌ <b>@{user_uname}</b> declined the 1v1 dice challenge.", parse_mode="HTML")
         return await callback_query.answer("Challenge declined.")
 
-    # Action is accept ("yes")
     conn, cursor = get_db()
     cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (battle["challenger_id"],))
     c_row = cursor.fetchone()
@@ -913,7 +934,7 @@ async def handle_dice_challenge_callback(callback_query: CallbackQuery):
         "wager": battle["wager"],
         "challenger_roll": None,
         "opponent_roll": None,
-        "current_turn": battle["challenger_id"] # Challenger rolls first
+        "current_turn": battle["challenger_id"]
     }
     del active_dice_battles[battle_id]
 
@@ -923,7 +944,7 @@ async def handle_dice_challenge_callback(callback_query: CallbackQuery):
 
     await callback_query.message.edit_text(
         f"✅ <b>@{user_uname}</b> accepted the challenge!\n\n"
-        f"🎯 It's <b>@{battle['challenger_uname']}</b>'s turn to roll first. Tap below to send your dice 🎲!",
+        f"🎯 It's <b>@{battle['challenger_uname']}</b>'s turn to throw dice 🎲. Tap below!",
         reply_markup=markup,
         parse_mode="HTML"
     )
@@ -941,7 +962,7 @@ async def handle_turn_roll(callback_query: CallbackQuery):
     user_uname = callback_query.from_user.username or callback_query.from_user.first_name
 
     if user_id != battle["current_turn"]:
-        return await callback_query.answer("⏳ It is not your turn to roll yet!", show_alert=True)
+        return await callback_query.answer("⏳ It is not your turn to throw dice yet!", show_alert=True)
 
     sent_dice = await callback_query.message.answer_dice(emoji="🎲")
     roll_val = sent_dice.dice.value
@@ -954,8 +975,8 @@ async def handle_turn_roll(callback_query: CallbackQuery):
             inline_keyboard=[[InlineKeyboardButton(text="🎲 Roll Dice", callback_data=f"roll_turn_{turn_id}")]]
         )
         await callback_query.message.answer(
-            f"🎲 <b>{battle['challenger_uname']}</b> rolled a `{roll_val}`!\n\n"
-            f"Now it's <b>@{battle['opponent_uname']}</b>'s turn! Tap below to roll 🎲.",
+            f"🎲 <b>@{battle['challenger_uname']}</b> threw dice 🎲 and got `{roll_val}`!\n\n"
+            f"Now <b>@{battle['opponent_uname']}</b>, it's your turn to throw dice 🎲. Tap below!",
             reply_markup=markup,
             parse_mode="HTML"
         )
@@ -965,7 +986,6 @@ async def handle_turn_roll(callback_query: CallbackQuery):
             pass
     else:
         battle["opponent_roll"] = roll_val
-        # Both rolled! Calculate winner
         c_id = battle["challenger_id"]
         c_uname = battle["challenger_uname"]
         c_roll = battle["challenger_roll"]
@@ -978,7 +998,6 @@ async def handle_turn_roll(callback_query: CallbackQuery):
         del active_turn_battles[turn_id]
 
         conn, cursor = get_db()
-        # Re-verify balances
         cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (c_id,))
         c_bal = cursor.fetchone()[0]
         cursor.execute("SELECT balance FROM user_balances WHERE user_id=?", (o_id,))
