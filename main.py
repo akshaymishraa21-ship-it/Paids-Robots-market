@@ -634,7 +634,7 @@ async def process_withdraw_wallet(message: Message, state: FSMContext):
     await message.reply(notif_msg, parse_mode="Markdown")
 
 
-# Stored globally so the bot remembers where the /topup command was invoked from
+# Memory storage to track where topup was invoked
 topup_invocation_context = {}
 
 @dp.message(Command("topup"))
@@ -656,17 +656,18 @@ async def cmd_topup(message: Message, state: FSMContext):
             else:
                 target_uname = target_query
 
-        # Save invocation chat and target info
+        # Save the exact chat ID where /topup was called so the notification goes back there
         topup_invocation_context[message.from_user.id] = {
             "chat_id": message.chat.id,
             "target_id": target_uid,
             "target_uname": target_uname
         }
 
+        # If typed in a group, send prompt to DM and clean group message
         if message.chat.type != "private":
             try:
                 await bot.send_message(OWNER_ID, "💵 How much would you like to top up? (Reply with amount):")
-                await message.reply("✅ Admin top-up prompt sent to your private DM!")
+                await message.reply("✅ Top-up deposit prompt sent to your private DM!")
             except Exception:
                 await message.reply("⚠️ Please start the bot in private DM first so it can message you securely.")
         else:
@@ -674,7 +675,7 @@ async def cmd_topup(message: Message, state: FSMContext):
 
         await state.set_state(TopupAdmin.waiting_for_amount)
     else:
-        # Public instruction for normal users
+        # Standard user public instructions
         await message.reply(
             "💳 **Top Up Instructions:**\n"
             "Please send the exact money within a few seconds to:\n"
@@ -702,7 +703,7 @@ async def process_admin_topup(message: Message, state: FSMContext):
     ctx = topup_invocation_context.pop(admin_id, {})
     target_id = ctx.get("target_id")
     target_uname = ctx.get("target_uname")
-    target_chat_id = ctx.get("chat_id", admin_id)
+    target_chat_id = ctx.get("chat_id", message.chat.id)
 
     conn, cursor = get_db()
     if target_id:
@@ -745,7 +746,7 @@ async def process_admin_topup(message: Message, state: FSMContext):
         await message.answer(success_msg, parse_mode="HTML")
 
 
-# --- WAGER STATS & 1V1 DICE BATTLE ---
+# --- WAGER STATS & 1V1 DICE CHALLENGE ---
 @dp.message(Command("wager"))
 async def cmd_wager(message: Message):
     user_id = message.from_user.id
@@ -770,7 +771,6 @@ async def cmd_wager(message: Message):
     await message.reply(stats_text, parse_mode="Markdown")
 
 
-# Active 1v1 challenges and live turn matches
 active_dice_battles = {}
 active_turn_battles = {}
 
@@ -788,7 +788,7 @@ async def cmd_dice(message: Message, state: FSMContext):
     if balance <= 0:
         return await message.reply("❌ You need a balance greater than $0 to play the dice game!")
 
-    # Check if replying to another user with a wager amount (e.g., /dice 1 or /dice 2)
+    # Check if replying to someone with a wager (e.g. /dice 1 or /dice 2)
     if message.reply_to_message and message.reply_to_message.from_user:
         target_user = message.reply_to_message.from_user
         if target_user.id == user_id:
@@ -834,7 +834,7 @@ async def cmd_dice(message: Message, state: FSMContext):
         )
         await message.reply(challenge_msg, reply_markup=markup, parse_mode="HTML")
     else:
-        # Solo vs Bot battle
+        # Solo vs Bot
         await state.set_state(DiceGameFlow.waiting_for_amount)
         await message.reply(f"🎲 **Dice Battle Game**\nYou have **${balance:.2f}** in your wallet.\n\nHow much would you like to wager against the bot?", parse_mode="Markdown")
 
