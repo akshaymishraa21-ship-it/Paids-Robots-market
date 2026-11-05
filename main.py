@@ -21,12 +21,12 @@ from aiogram.fsm.state import State, StatesGroup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from keep_alive import keep_alive
 
-# 🟢 API TOKEN APPLIED
+# 🟢 NEW API TOKEN APPLIED
 BOT_TOKEN = os.environ.get(
-    "BOT_TOKEN", "8488349023:AAEReI7Imm6KH2pWPnjxWS5KPGhc5Y6DSHk"
+    "BOT_TOKEN", "8488349023:AAF_pA1C2mbuDZlYkQa4lAPH66aLsDZ0hAA"
 )
 OWNER_ID = int(os.environ.get("BOT_OWNER_ID", "6146191046"))
-STARS_PER_POST = 400
+STARS_PER_POST = 500  # Updated to 500 as requested
 ADMIN_USERNAMES = ["disturbor"]
 
 logging.basicConfig(level=logging.INFO)
